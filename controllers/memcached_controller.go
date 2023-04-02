@@ -192,11 +192,11 @@ func (r *MemcachedReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	// Check if the deployment already exists, if not create a new one
-	found := &appsv1.Deployment{}
+	// found := &appsv1.Deployment{}
+	found := &appsv1.ReplicaSet{}
 	err = r.Get(ctx, types.NamespacedName{Name: memcached.Name, Namespace: memcached.Namespace}, found)
 	if err != nil && apierrors.IsNotFound(err) {
-		// Define a new deployment
-		dep, err := r.deploymentForMemcached(memcached)
+		dep, err := r.replicaSetForMemcached(memcached)
 		if err != nil {
 			log.Error(err, "Failed to define new Deployment resource for Memcached")
 
@@ -213,67 +213,23 @@ func (r *MemcachedReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			return ctrl.Result{}, err
 		}
 
-		log.Info("Creating a new Deployment",
-			"Deployment.Namespace", dep.Namespace, "Deployment.Name", dep.Name)
+		log.Info("Creating a new Replicaset",
+			"Replicaset.Namespace", dep.Namespace, "Replicaset.Name", dep.Name)
 		if err = r.Create(ctx, dep); err != nil {
-			log.Error(err, "Failed to create new Deployment",
-				"Deployment.Namespace", dep.Namespace, "Deployment.Name", dep.Name)
+			log.Error(err, "Failed to create new Replicaset",
+				"Replicaset.Namespace", dep.Namespace, "Replicaset.Name", dep.Name)
 			return ctrl.Result{}, err
 		}
 
-		// Deployment created successfully
+		// Replicaset created successfully
 		// We will requeue the reconciliation so that we can ensure the state
 		// and move forward for the next operations
 		return ctrl.Result{RequeueAfter: time.Minute}, nil
 	} else if err != nil {
-		log.Error(err, "Failed to get Deployment")
+		log.Error(err, "Failed to get Replicaset")
 		// Let's return the error for the reconciliation be re-trigged again
 		return ctrl.Result{}, err
 	}
-
-	// The CRD API is defining that the Memcached type, have a MemcachedSpec.Size field
-	// to set the quantity of Deployment instances is the desired state on the cluster.
-	// Therefore, the following code will ensure the Deployment size is the same as defined
-	// via the Size spec of the Custom Resource which we are reconciling.
-	size := memcached.Spec.Size
-	if *found.Spec.Replicas != size {
-		found.Spec.Replicas = &size
-		if err = r.Update(ctx, found); err != nil {
-			log.Error(err, "Failed to update Deployment",
-				"Deployment.Namespace", found.Namespace, "Deployment.Name", found.Name)
-
-			// Re-fetch the memcached Custom Resource before update the status
-			// so that we have the latest state of the resource on the cluster and we will avoid
-			// raise the issue "the object has been modified, please apply
-			// your changes to the latest version and try again" which would re-trigger the reconciliation
-			if err := r.Get(ctx, req.NamespacedName, memcached); err != nil {
-				log.Error(err, "Failed to re-fetch memcached")
-				return ctrl.Result{}, err
-			}
-
-			// The following implementation will update the status
-			meta.SetStatusCondition(&memcached.Status.Conditions, metav1.Condition{Type: typeAvailableMemcached,
-				Status: metav1.ConditionFalse, Reason: "Resizing",
-				Message: fmt.Sprintf("Failed to update the size for the custom resource (%s): (%s)", memcached.Name, err)})
-
-			if err := r.Status().Update(ctx, memcached); err != nil {
-				log.Error(err, "Failed to update Memcached status")
-				return ctrl.Result{}, err
-			}
-
-			return ctrl.Result{}, err
-		}
-
-		// Now, that we update the size we want to requeue the reconciliation
-		// so that we can ensure that we have the latest state of the resource before
-		// update. Also, it will help ensure the desired state on the cluster
-		return ctrl.Result{Requeue: true}, nil
-	}
-
-	// The following implementation will update the status
-	meta.SetStatusCondition(&memcached.Status.Conditions, metav1.Condition{Type: typeAvailableMemcached,
-		Status: metav1.ConditionTrue, Reason: "Reconciling",
-		Message: fmt.Sprintf("Deployment for custom resource (%s) with %d replicas created successfully", memcached.Name, size)})
 
 	if err := r.Status().Update(ctx, memcached); err != nil {
 		log.Error(err, "Failed to update Memcached status")
@@ -401,6 +357,57 @@ func (r *MemcachedReconciler) deploymentForMemcached(
 					}},
 				},
 			},
+		},
+	}
+
+	// Set the ownerRef for the Deployment
+	// More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/owners-dependents/
+	if err := ctrl.SetControllerReference(memcached, dep, r.Scheme); err != nil {
+		return nil, err
+	}
+	return dep, nil
+}
+
+// deploymentForMemcached returns a Memcached Deployment object
+func (r *MemcachedReconciler) replicaSetForMemcached(
+	memcached *cachev1alpha1.Memcached) (*appsv1.ReplicaSet, error) {
+	// ls := labelsForMemcached(memcached.Name)
+	replicas := memcached.Spec.Size
+	image, err := imageForMemcached()
+
+	labels := map[string]string{
+		"app": "my-app",
+	}
+
+	container := corev1.Container{
+		Name:  "my-container",
+		Image: image,
+	}
+
+	podTemplate := corev1.PodTemplateSpec{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: labels,
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{container},
+		},
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	dep := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      memcached.Name,
+			Namespace: memcached.Namespace,
+		},
+		Spec: appsv1.ReplicaSetSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: labels,
+			},
+			Template: podTemplate,
 		},
 	}
 
